@@ -3,8 +3,9 @@
     python -m agent.main tick           # every 15 min: news, calendar, tracking, signals, /commands
     python -m agent.main brief-london   # tick + Claude web-search brief before London
     python -m agent.main brief-ny       # tick + Claude web-search brief before New York
-    python -m agent.main weekly         # tick + weekly scoreboard + backtest refresh
-    python -m agent.main backtest       # backtest only (posts results)
+    python -m agent.main weekly         # tick + weekly scoreboard + strategy research
+    python -m agent.main research       # test all rule sets on ~10 months, pick one only if it holds on unseen data
+    python -m agent.main backtest       # quick backtest of the live strategy (posts results)
     python -m agent.main status         # tick + post a market status snapshot
     python -m agent.main test           # check every connection and post a report
 Add --dry-run to print messages instead of sending them.
@@ -21,22 +22,24 @@ from zoneinfo import ZoneInfo
 from . import backtest as bt
 from . import messages as msg
 from . import news
+from . import research as rs
 from . import state as state_mod
+from . import variants
 from .charts import signal_chart
 from .config import Config
-from .data import fetch_kraken, fetch_twelvedata, get_history, get_live_candles
+from .data import fetch_kraken, fetch_twelvedata, get_history, get_live_candles, get_long_history
 from .llm import LLM, sanitize_html
 from .strategy import build_context, evaluate_at, key_levels, summarize, summary_text
 from .telegram import Telegram, strip_tags
 from .tracker import advance, init_tracking, stats
 
 log = logging.getLogger("agent")
-MODES = ("tick", "brief-london", "brief-ny", "weekly", "backtest", "status", "test")
+MODES = ("tick", "brief-london", "brief-ny", "weekly", "research", "backtest", "status", "test")
 
 HELP = ("🤖 <b>Signal agent commands</b>\n"
         "/status – live trend, scores and key levels for XAU and BTC\n"
         "/score – running scoreboard of all signals\n"
-        "/brief – fresh Claude news brief (max 3 per day)\n"
+        "/brief – fresh market brief: trend, levels, events, headlines (max 3 per day)\n"
         "/check sell xau 4246.49 0.01 – how the market looks for a position you already hold\n"
         "/help – this message\n"
         "<i>The agent wakes every ~15 minutes on weekdays, so replies can take up to 15 minutes.</i>")
@@ -52,7 +55,7 @@ def fromiso(s: str) -> datetime:
 
 class Agent:
     def __init__(self, cfg: Config, now: datetime | None = None, telegram: Telegram | None = None,
-                 llm_client=None, fetch=None, session=None, history=None):
+                 llm_client=None, fetch=None, session=None, history=None, long_history=None):
         self.cfg = cfg
         self.now = now or datetime.now(timezone.utc)
         self.state = state_mod.load(cfg.state_dir)
@@ -63,6 +66,7 @@ class Agent:
         self.llm = LLM(cfg, self.state, client=llm_client)
         self.fetch = fetch or get_live_candles
         self.history = history or get_history
+        self.long_history = long_history or get_long_history
         self.session = session
         self.ctx, self.evals, self.summaries, self.live_price, self.bias = {}, {}, {}, {}, {}
         self.errors: list[str] = []
@@ -78,6 +82,24 @@ class Agent:
     def fail(self, where: str, e: Exception) -> None:
         log.exception("%s failed", where)
         self.errors.append(self.redact(f"{where}: {type(e).__name__}: {e}")[:300])
+
+    def active_strategy(self, key: str):
+        """(Params, validation info, overridden?) for a symbol.
+
+        Priority: XAU_/BTC_STRATEGY variable > research winner (if AUTO_STRATEGY) > v1.
+        A strategy counts as validated only if the latest research says it passed the unseen-data test.
+        """
+        res = self.state.get("research", {}).get(key) or {}
+        override = self.cfg.strategy_override(key)
+        if override and override in variants.VARIANTS:
+            name, overridden = override, True
+        elif self.cfg.auto_strategy and res.get("winner"):
+            name, overridden = res["winner"], False
+        else:
+            name, overridden = "v1", False
+        info = (res.get("variants") or {}).get(name) or {}
+        validation = {"name": name, "validated": bool(info.get("passed")), "unseen": info.get("unseen")}
+        return variants.get(name), validation, overridden
 
     def local_day(self) -> str:
         return self.now.astimezone(ZoneInfo(self.cfg.display_tz)).strftime("%a %d %b")
@@ -128,8 +150,30 @@ class Agent:
             fresh.sort(key=lambda it: -it["score"]["impact"])
             if fresh:
                 self.tg.send(msg.news_alert(fresh[:5], self.cfg))
+                for it in fresh[:5]:
+                    it["alerted"] = True
         for key, spec in self.cfg.specs.items():
             self.bias[key] = news.news_bias(store["items"], spec.asset, self.now)
+        self.maybe_digest()
+
+    def maybe_digest(self) -> None:
+        """Every NEWS_DIGEST_HOURS (06-20 UTC, on even slots): the newest relevant headlines with links."""
+        n = self.cfg.news_digest_hours
+        if n <= 0 or not (6 <= self.now.hour <= 20) or self.now.hour % n:
+            return
+        store = self.state["news"]
+        last = store.get("last_digest")
+        if last and self.now - fromiso(last) < timedelta(minutes=90 if n >= 2 else 45):
+            return
+        since = fromiso(last) if last else self.now - timedelta(hours=n)
+        since = max(since, self.now - timedelta(hours=max(n, 3)))
+        items = [it for it in store["items"] if fromiso(it["published"]) > since and not it.get("alerted")
+                 and news.digest_relevant(it)]
+        if not items:
+            return
+        store["last_digest"] = iso(self.now)
+        items.sort(key=lambda it: (it.get("score", {}).get("impact", 1), it["published"]), reverse=True)
+        self.tg.send(msg.news_digest(items[:8], self.cfg, n, self.now), silent=True)
 
     def headlines_text(self, hours: float = 12, limit: int = 10, min_impact: int = 2) -> str:
         cut = self.now - timedelta(hours=hours)
@@ -184,9 +228,11 @@ class Agent:
             raise RuntimeError(f"only {n} M15 bars available")
         bias = self.bias.get(key, 0.0)
         blackout = news.blackout_reason(self.events(), self.cfg, self.now)
-        latest = evaluate_at(ctx, n - 1, self.cfg, bias, blackout)
+        params, validation, _ = self.active_strategy(key)
+        latest = evaluate_at(ctx, n - 1, self.cfg, bias, blackout, params)
         self.evals[key] = latest
         self.summaries[key] = summarize(ctx, n - 1, latest, self.live_price.get(key))
+        self.summaries[key].update(strategy=params.name, validated=validation["validated"])
 
         last_eval = self.state["last_eval_bar"].get(key)
         candidates = [i for i in (n - 1, n - 2)
@@ -199,7 +245,7 @@ class Agent:
         if lc and self.now - fromiso(lc) < timedelta(minutes=self.cfg.cooldown_minutes):
             return
         for i in candidates:
-            ev = latest if i == n - 1 else evaluate_at(ctx, i, self.cfg, bias, blackout)
+            ev = latest if i == n - 1 else evaluate_at(ctx, i, self.cfg, bias, blackout, params)
             sig = ev.signal
             if not sig:
                 continue
@@ -212,10 +258,10 @@ class Agent:
             if price is not None and (s * (price - sig["entry"]) > 0.5 * sig["atr"] or s * (price - sig["sl"]) <= 0):
                 log.info("%s signal missed: price %.2f already moved away from entry %.2f", key, price, sig["entry"])
                 continue
-            self.publish(sig, spec, ctx, bias)
+            self.publish(sig, spec, ctx, bias, validation)
             break
 
-    def publish(self, sig: dict, spec, ctx, bias: float) -> None:
+    def publish(self, sig: dict, spec, ctx, bias: float, validation: dict | None = None) -> None:
         review = None
         if self.cfg.llm_review_signals and self.llm.available:
             review = self.llm.review_signal(sig, summary_text(self.summaries[spec.key]),
@@ -228,16 +274,17 @@ class Agent:
         sig["created"] = iso(self.now)
         sig["review"] = review
         sig["news_bias"] = bias
+        sig["validated"] = bool(validation and validation.get("validated"))
         init_tracking(sig)
         self.state["open_signals"].append(sig)
         calib = (self.state.get("calibration", {}).get(spec.key) or {}).get(sig["grade"])
-        text = msg.signal_message(sig, spec, self.cfg, bias, review, calib)
+        text = msg.signal_message(sig, spec, self.cfg, bias, review, calib, validation)
         png = (signal_chart(ctx.m, sig, f"{spec.display} M15 · {sig['side']} #{sig['id']}", decimals=spec.decimals)
                if self.cfg.send_charts else None)
         if png and len(strip_tags(text)) <= 1000:
             self.tg.send_photo(png, text)
         elif png:
-            self.tg.send_photo(png, msg.short_caption(sig, spec))
+            self.tg.send_photo(png, msg.short_caption(sig, spec, paper=not sig["validated"]))
             self.tg.send(text)
         else:
             self.tg.send(text)
@@ -363,14 +410,33 @@ class Agent:
                                     stats([s for s in closed if (s.get("closed_at") or "") >= week_ago]),
                                     self.state["open_signals"]))
         self.tg.send(msg.scoreboard("All-time scoreboard", stats(closed), []))
-        self.run_backtest()
+        self.run_research()
+
+    def run_research(self) -> None:
+        store = self.state.setdefault("research", {})
+        for key, spec in self.cfg.specs.items():
+            try:
+                before, _, _ = self.active_strategy(key)
+                d = self.long_history(spec, self.cfg, days=self.cfg.research_days)
+                ctx = build_context(d["M15"], d["H1"], d["H4"], spec)
+                result = rs.run(ctx, self.cfg)
+                rs.save_csv(result, os.path.join(self.cfg.state_dir, f"research_{key}.csv"))
+                store[key] = rs.summary_for_state(result)
+                store[key]["updated"] = iso(self.now)
+                after, _, overridden = self.active_strategy(key)
+                self.tg.send(msg.research_message(spec, result, after.name, overridden,
+                                                  before.name if before.name != after.name else None))
+                log.info("research %s: winner=%s", key, result["winner"])
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"research {key}", e)
 
     def run_backtest(self) -> None:
         for key, spec in self.cfg.specs.items():
             try:
+                params, _, _ = self.active_strategy(key)
                 d = self.history(spec, self.cfg)
                 ctx = build_context(d["M15"], d["H1"], d["H4"], spec)
-                trades, res = bt.run(ctx, self.cfg)
+                trades, res = bt.run(ctx, self.cfg, params)
                 bt.save_csv(trades, os.path.join(self.cfg.state_dir, f"backtest_{key}.csv"))
                 self.state["calibration"][key] = {"A": res["A"], "B": res["B"], "all": res["all"],
                                                   "period": res["period"], "updated": iso(self.now)}
@@ -403,11 +469,22 @@ class Agent:
         items, status = news.fetch_headlines(self.now, session=self.session)
         for name, s in status.items():
             lines.append(f"{'✅' if s.startswith('ok') else '⚠️'} News · {msg.esc(name)}: {msg.esc(s)}")
-        check("Claude API", lambda: self.llm.ping())
+        if self.llm.available:
+            check("Claude API", lambda: self.llm.ping())
+            ai = f"AI: on — {cfg.model_fast} (headlines), {cfg.model_smart} (briefs, reviews)"
+        else:
+            lines.append("ℹ️ AI (Claude): off — free mode, news scored by keyword rules")
+            ai = "AI: off (free mode)"
+        strat = []
+        for key, spec in cfg.specs.items():
+            p, v, _ = self.active_strategy(key)
+            strat.append(f"{spec.display}: {p.name} ({'✅ validated' if v['validated'] else '📝 paper'})")
+        digest = f"every {cfg.news_digest_hours}h" if cfg.news_digest_hours > 0 else "off"
         lines += ["", "<b>Settings</b>",
                   f"Symbols {', '.join(s.display for s in cfg.specs.values())} · risk {cfg.risk_pct:g}% of "
-                  f"${cfg.account_balance:,.0f} · min score {cfg.min_score} · sells {'on' if cfg.allow_sells else 'off'}",
-                  f"Models: {cfg.model_fast} (headlines), {cfg.model_smart} (briefs, reviews)",
+                  f"${cfg.account_balance:,.0f} · sells {'on' if cfg.allow_sells else 'off'}",
+                  "Strategies: " + " · ".join(strat),
+                  f"{ai} · news digest {digest}",
                   f"Times shown in {cfg.display_tz} and MT5 server time (UTC)."]
         self.tg.send("\n".join(lines))
         self.tg.send(HELP)
@@ -419,6 +496,9 @@ class Agent:
             return
         if mode == "backtest":
             self.run_backtest()
+            return
+        if mode == "research":
+            self.run_research()
             return
         self.step_calendar()
         self.step_news()

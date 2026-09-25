@@ -23,6 +23,19 @@ MACRO_KEYWORDS = re.compile(
     r"safe[- ]haven|missile|ceasefire|opec|oil)\b", re.I)
 
 
+CRYPTO_KEYWORDS = re.compile(
+    r"\b(bitcoin|btc|etf|sec|fed|federal reserve|powell|stablecoin|regulat\w*|hack\w*|exploit|liquidat\w*|"
+    r"treasur\w*|blackrock|microstrategy|saylor|halving|miners?|whales?|reserve|tariffs?|inflation|"
+    r"rate (cut|hike)s?|outflows?|inflows?|crash\w*|rall(y|ies)|record high|all-time high|sell-?off)\b", re.I)
+
+
+def digest_relevant(item: dict) -> bool:
+    """Macro items are already keyword-filtered; crypto items must be about BTC or the wider market."""
+    if item.get("kind") != "crypto":
+        return True
+    return bool(CRYPTO_KEYWORDS.search(item["title"] + " " + item.get("summary", "")))
+
+
 def _hash(*parts: str) -> str:
     return hashlib.sha1("|".join(p or "" for p in parts).encode()).hexdigest()[:16]
 

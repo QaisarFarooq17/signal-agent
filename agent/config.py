@@ -100,12 +100,22 @@ class Config:
     llm_review_signals: bool = field(default_factory=lambda: _bool("LLM_REVIEW_SIGNALS", True))
     llm_can_veto: bool = field(default_factory=lambda: _bool("LLM_CAN_VETO", False))
     news_alert_min_impact: int = field(default_factory=lambda: _int("NEWS_ALERT_MIN_IMPACT", 4))
+    news_digest_hours: int = field(default_factory=lambda: _int("NEWS_DIGEST_HOURS", 2))
+
+    # --- strategy selection & research ---
+    xau_strategy: str | None = field(default_factory=lambda: _env("XAU_STRATEGY"))
+    btc_strategy: str | None = field(default_factory=lambda: _env("BTC_STRATEGY"))
+    auto_strategy: bool = field(default_factory=lambda: _bool("AUTO_STRATEGY", True))
+    research_days: int = field(default_factory=lambda: _int("RESEARCH_DAYS", 300))
 
     # --- misc ---
     display_tz: str = field(default_factory=lambda: _env("DISPLAY_TZ", "Europe/Rome"))
     state_dir: str = field(default_factory=lambda: _env("STATE_DIR", ".state"))
     dry_run: bool = field(default_factory=lambda: _bool("DRY_RUN", False))
     send_charts: bool = field(default_factory=lambda: _bool("SEND_CHARTS", True))
+
+    def strategy_override(self, key: str) -> str | None:
+        return {"XAUUSD": self.xau_strategy, "BTCUSD": self.btc_strategy}.get(key)
 
     @property
     def specs(self) -> dict[str, SymbolSpec]:

@@ -119,6 +119,7 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     c = d["close"]
     d["ema20"], d["ema50"], d["ema200"] = ema(c, 20), ema(c, 50), ema(c, 200)
     d["rsi"] = rsi(c, 14)
+    d["rsi2"] = rsi(c, 2)
     d["atr"] = atr(d, 14)
     d["macd"], d["macd_sig"], d["macd_hist"] = macd(c)
     d["adx"], d["pdi"], d["mdi"] = adx(d, 14)

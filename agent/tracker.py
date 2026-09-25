@@ -1,8 +1,9 @@
 """Follows every signal to its outcome and keeps an honest scoreboard.
 
-Management rule used everywhere (live and backtest):
-  * close half at TP1 and move the stop to entry (break-even)
-  * close the rest at TP2, at break-even, or at market when the signal expires
+Management rule used everywhere (live and backtest), per the rule set that sent the signal:
+  * close `partial` (default half) at TP1 and move the stop to entry (break-even)
+  * close the rest at TP2, at the stop, or at market when the signal expires
+  * single-target rule sets (partial = 1) close everything at TP1
   * if a single candle touches both SL and TP, assume the SL was hit first (conservative)
   * the spread is charged on every trade
 """
@@ -36,10 +37,16 @@ def init_tracking(sig: dict) -> dict:
 
 
 def advance(sig: dict, bars, expiry_bars: int, spread: float) -> list[tuple[str, float, str]]:
-    """Walk closed bars (iterable of (time_iso, high, low, close)) after the signal. Returns events."""
+    """Walk closed bars (iterable of (time_iso, high, low, close)) after the signal. Returns events.
+
+    Uses the signal's own exit plan: `partial` = share closed at TP1 (1.0 = single target),
+    `be` = move the stop to entry after TP1.
+    """
     init_tracking(sig)
     events = []
     s = 1 if sig["side"] == "BUY" else -1
+    part = float(sig.get("partial", 0.5))
+    rest = max(0.0, 1.0 - part)
     for t, h, l, c in bars:
         if sig["status"] != "open":
             break
@@ -57,27 +64,33 @@ def advance(sig: dict, bars, expiry_bars: int, spread: float) -> list[tuple[str,
                 break
             if hit_tp1:
                 sig["tp1_hit"] = True
-                sig["realized_r"] += 0.5 * r_of(sig, sig["tp1"])
-                sig["sl_current"] = sig["entry"]
+                sig["realized_r"] += part * r_of(sig, sig["tp1"])
                 events.append(("tp1", sig["tp1"], t))
+                if rest <= 1e-9:
+                    _close(sig, sig["tp1"], t, "tp1", spread)
+                    break
+                if sig.get("be", True):
+                    sig["sl_current"] = sig["entry"]
                 if hit_tp2:
-                    sig["realized_r"] += 0.5 * r_of(sig, sig["tp2"])
+                    sig["realized_r"] += rest * r_of(sig, sig["tp2"])
                     _close(sig, sig["tp2"], t, "tp2", spread)
                     events.append(("tp2", sig["tp2"], t))
                     break
                 continue
         else:
             if hit_sl:
-                _close(sig, sig["entry"], t, "be", spread)
-                events.append(("be", sig["entry"], t))
+                sig["realized_r"] += rest * r_of(sig, sl)
+                reason = "be" if abs(sl - sig["entry"]) < 1e-9 else "sl"
+                _close(sig, sl, t, reason, spread)
+                events.append((reason, sl, t))
                 break
             if hit_tp2:
-                sig["realized_r"] += 0.5 * r_of(sig, sig["tp2"])
+                sig["realized_r"] += rest * r_of(sig, sig["tp2"])
                 _close(sig, sig["tp2"], t, "tp2", spread)
                 events.append(("tp2", sig["tp2"], t))
                 break
         if sig["bars"] >= expiry_bars:
-            remaining = 0.5 if sig["tp1_hit"] else 1.0
+            remaining = rest if sig["tp1_hit"] else 1.0
             sig["realized_r"] += remaining * r_of(sig, c)
             _close(sig, c, t, "expired", spread)
             events.append(("expired", c, t))

@@ -4,22 +4,24 @@ A signal agent for **XAUUSD** and **BTCUSD** that runs for free on GitHub Action
 
 | What | When |
 |---|---|
-| 🟢/🔴 **Trade signals**: entry, stop-loss, TP1, TP2, lot size, reasons, chart | When a setup scores ≥ 65/100 (checked every 15 min, Mon–Fri) |
+| 🟢/🔴 **Trade signals**: entry, stop-loss, targets, lot size, reasons, chart. Marked 📝 **PAPER** until the strategy passes the research test | When a setup triggers (checked every 15 min, Mon–Fri) |
 | ✅❌ **Signal updates**: TP1 hit (move SL to entry), TP2, stop, expiry | As they happen |
-| 📰 **Market-moving news**, scored by Claude for gold and BTC | Within ~15 min of publication |
+| 📰 **Market-moving news** alerts (keyword rules, or Claude if you add a key) | Within ~15 min of publication |
+| 🗞️ **News digest**: newest gold/BTC headlines with links | Every 2 h, 08:00–22:00 Rome (summer) |
 | ⏰ **Event warnings** (CPI, NFP, FOMC…); new signals paused ±30 min | ~35–50 min before the event |
-| 🌅 **London brief** and 🗽 **New York brief** (Claude + live web search) | 08:25 and 14:10 Rome time (summer) |
-| 📊 **Weekly report + backtest refresh** | Friday evening |
+| 🌅 **London brief** and 🗽 **New York brief**: trend, levels, events, headlines (AI-written with a Claude key) | 08:25 and 14:10 Rome time (summer) |
+| 📊 **Weekly report + 🔬 strategy research** (tests 18 rule sets on ~10 months of data) | Friday evening |
 | Replies to `/status` `/score` `/brief` `/check` | Next run (≤ 15 min) |
 
-> **Please read this first.** Nobody can predict the next candle, and neither can this agent. What it does is combine trend across several timeframes, momentum, volatility, key levels, news and event risk into a **score**. It stays quiet when there's no clear setup, and it always sends a stop-loss. It has only been tested on synthetic data so far. **Run the backtest (step 7) and paper-trade for 2 weeks before you risk real money.** This is not financial advice.
+> **Please read this first.** Nobody can predict the next candle, and neither can this agent. What it does is combine trend across several timeframes, momentum, volatility, key levels, news and event risk into a **score**. It stays quiet when there's no clear setup, and it always sends a stop-loss. **Signals are marked 📝 PAPER until a rule set passes the research test on data it wasn't tuned on (step 7). Even then, paper-trade for 2 weeks before you risk real money.** This is not financial advice.
 
 ---
 
 ## Example signal
 
 ```
-🟢 BUY XAUUSDm · Grade A · 83/100
+📝 PAPER SIGNAL — for testing only, this strategy has not passed validation yet
+🟢 BUY XAUUSDm · score 83/100
 Pullback in trend · M15 close 16:15 Rome (14:15 MT5)
 
 Entry 4262.40 (still valid up to 4264.60)
@@ -36,8 +38,8 @@ Why
 • bullish engulfing candle
 • clear room: next level prev-day high 4281.20 (2.0R)
 
-🤖 Claude check: ✅ CONFIRM — no opposing news; next US data is tomorrow
-🧪 Backtest, grade A: TP1 hit 57% · avg +0.38R · n=23
+🔬 Strategy v1: not validated
+(once a rule set passes the research, the PAPER line disappears and this shows its unseen-data results)
 ```
 (A chart with the entry, SL and TP lines is attached to every signal.)
 
@@ -97,14 +99,21 @@ Repository → **Settings → Secrets and variables → Actions**.
 | `LLM_CAN_VETO` | `false` | `true` = Claude can block a signal it rejects |
 | `LLM_DAILY_CALL_CAP` | `150` | hard cap on Claude calls per day |
 | `COOLDOWN_MINUTES` / `NEWS_BLACKOUT_MINUTES` | `60` / `30` | wait after a closed signal / pause around high-impact events |
+| `NEWS_DIGEST_HOURS` | `2` | headline digest every N hours (`0` = off) |
+| `NEWS_ALERT_MIN_IMPACT` | `4` | instant news alerts from this impact level (1–5); `3` = more alerts |
+| `AUTO_STRATEGY` | `true` | use the research winner automatically; `false` = stay on `v1` unless you choose |
+| `XAU_STRATEGY` / `BTC_STRATEGY` | *(empty)* | force a rule set by name, e.g. `pb_aligned_1R` (names are in the research report) |
+| `RESEARCH_DAYS` | `300` | how much history the research uses |
 
 ### 6. Switch it on and test
 Repository → **Actions** tab → enable workflows if asked → **signal-agent** → **Run workflow** → mode `test` → Run.
 Within ~1 minute your Telegram group should get a **🔧 Connection test** message with a ✅/❌ for each service.
 
-### 7. Run the backtest
-**Run workflow** → mode `backtest`. You'll get the win rate, average R, profit factor and max drawdown for about the last 2 months of M15 data for each symbol. The trade-by-trade CSV is under the run's **Artifacts**.
-After that, signals quote their grade's historical hit rate.
+### 7. Run the strategy research
+**Run workflow** → mode `research` (takes about 5–8 minutes). For each symbol it downloads ~10 months of candles and tests **18 rule sets** (see below). Each one is tuned on the first 65% of the period and then checked on the last 35%, which it has never seen.
+- If a rule set makes money in **both** periods, it becomes the live strategy for that symbol and its signals lose the 📝 PAPER tag.
+- If none does, signals stay 📝 PAPER (for testing only).
+The research repeats every Friday, and the full table is under the run's **Artifacts**. Mode `backtest` gives a quick 2-month check of the current live strategy.
 
 ### 8. Done
 The schedule starts on its own. Try `/status` in the group (the reply arrives on the next run).
@@ -118,7 +127,7 @@ The schedule starts on its own. Try `/status` in the group (the reply arrives on
 | Tick: news, events, signals, tracking, commands | every 15 min, Mon–Fri | — | — |
 | London brief | 06:25 | 08:25 | 07:25 |
 | New York brief | 12:10 | 14:10 | 13:10 |
-| Weekly report + backtest | Fri 20:40 | 22:40 | 21:40 |
+| Weekly report + strategy research | Fri 20:40 | 22:40 | 21:40 |
 
 GitHub runs scheduled jobs on a "best effort" basis, so a run can start 5–20 minutes late at busy times. Signals whose entry has already been missed are skipped automatically.
 
@@ -128,11 +137,24 @@ GitHub runs scheduled jobs on a "best effort" basis, so a run can start 5–20 m
 |---|---|
 | `/status` | trend on H4/H1/M15, RSI, ADX, ATR, nearest support/resistance, buy & sell scores, news bias, open signals, next events |
 | `/score` | the live scoreboard (every signal is followed to TP/SL, nothing is hidden) |
-| `/brief` | a fresh Claude news brief (max 3 per day) |
+| `/brief` | a fresh market brief now (max 3 per day) |
 | `/check sell xau 4246.49 0.01` | for a position **you already hold**: live P/L, whether the trend is with or against you, a structure-based stop and its cost, and upcoming events |
 | `/help` | the list above |
 
 ---
+
+## Strategy research and 📝 PAPER signals
+
+The original strategy (`v1`) did not make money in its first real-data backtest, so the agent now tests alternatives and only trusts one that proves itself on unseen data.
+
+| Family | Rule sets | Idea |
+|---|---|---|
+| Original score | `v1`, `v1_buy`, `v1_strict`, `v1_sessions`, `v1_adx25`, `v1_wide_sl`, `pullback_only`, `breakout_only` | confluence score, with one change each (BUY only, score ≥ 75, London/NY hours only, strong trend only, wider stops, one setup type) |
+| Aligned pullback | `pb_aligned`, `pb_aligned_1R`, `pb_aligned_2R`, `pb_aligned_sess`, `pb_aligned_buy` | pullback only when the H4 **and** H1 trends agree; different targets and hours |
+| RSI(2) dip | `rsi2_trend`, `rsi2_trend_1.5` | buy short-term oversold dips (sell overbought rips) in the direction of the H4 trend |
+| London breakout | `london_break`, `london_break_h1`, `london_break_2R` | trade the break of the Asian-session range (00–07 UTC) between 07 and 11 UTC |
+
+**How the winner is chosen:** rank by results on the tuning period only, then walk down the top 3. The first rule set that also passes on the unseen period wins: at least 10 trades, ≥ +0.05R per trade and profit factor ≥ 1.1 (tuning period: ≥ 20 trades, ≥ +0.10R, PF ≥ 1.15). Choosing on one period and confirming on another stops us from just picking the luckiest of 18. Still, a pass is evidence, not proof.
 
 ## How a signal is scored (0–100)
 
@@ -195,9 +217,11 @@ python -m pytest -q                     # offline tests (synthetic data)
 
 ```
 agent/config.py      settings (env vars), symbols, news sources
-agent/data.py        candles: Twelve Data (gold), Kraken (BTC)
+agent/data.py        candles: Twelve Data (gold, long history), Kraken (BTC)
 agent/indicators.py  EMA, RSI, ATR, MACD, ADX, Supertrend, Bollinger width, patterns, swings
-agent/strategy.py    multi-timeframe scoring, stops/targets, lot size
+agent/strategy.py    multi-timeframe scoring, setups, stops/targets, lot size
+agent/variants.py    the 18 named rule sets
+agent/research.py    tuning vs unseen-data test and winner selection
 agent/tracker.py     follows signals to TP/SL, scoreboard stats
 agent/backtest.py    walk-forward backtest with the live logic
 agent/news.py        RSS headlines, rule-based scoring, economic calendar

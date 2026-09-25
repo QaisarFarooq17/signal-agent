@@ -32,37 +32,60 @@ def signed(spec: SymbolSpec, v: float) -> str:
     return ("+" if v >= 0 else "−") + f"{abs(v):.{spec.decimals}f}"
 
 
+def fmt_stats(st: dict | None) -> str:
+    if not st or not st.get("n"):
+        return "no trades"
+    pf = st.get("profit_factor", 0)
+    pf_s = "∞" if pf == math.inf or pf >= 999 else f"{pf:.2f}"
+    return f"n={st['n']} · {st['win_rate'] * 100:.0f}% win · {st['avg_r']:+.2f}R/trade · PF {pf_s}"
+
+
 def signal_message(sig: dict, spec: SymbolSpec, cfg: Config, news_b: float | None = None,
-                   review: dict | None = None, calib: dict | None = None) -> str:
+                   review: dict | None = None, calib: dict | None = None, validation: dict | None = None) -> str:
     buy = sig["side"] == "BUY"
     s = 1 if buy else -1
     close_t = datetime.fromisoformat(sig["bar_time"]) + timedelta(minutes=15)
     chase = sig["entry"] + s * 0.5 * sig["atr"]
     r1 = abs(sig["tp1"] - sig["entry"]) / sig["sl_dist"]
     r2 = abs(sig["tp2"] - sig["entry"]) / sig["sl_dist"]
-    setup = {"pullback": "Pullback in trend", "breakout": "Range breakout"}.get(sig["setup"], sig["setup"])
-    lines = [
-        f"{'🟢' if buy else '🔴'} <b>{sig['side']} {esc(spec.display)}</b> · Grade {sig['grade']} · {sig['score']}/100",
+    single = float(sig.get("partial", 0.5)) >= 0.999
+    setup = {"pullback": "Pullback in trend", "breakout": "Range breakout", "rsi2": "RSI(2) dip in trend",
+             "london": "London breakout of the Asian range"}.get(sig["setup"], sig["setup"])
+    validated = bool(validation and validation.get("validated"))
+    lines = []
+    if not validated:
+        lines.append("📝 <b>PAPER SIGNAL</b> — for testing only, this strategy has not passed validation yet")
+    lines += [
+        f"{'🟢' if buy else '🔴'} <b>{sig['side']} {esc(spec.display)}</b> · score {sig['score']}/100",
         f"<i>{setup} · M15 close {when(close_t, cfg)}</i>",
         "",
         f"Entry <b>{px(spec, sig['entry'])}</b> (still valid {'up to' if buy else 'down to'} {px(spec, chase)})",
         f"SL <b>{px(spec, sig['sl'])}</b> ({signed(spec, sig['sl'] - sig['entry'])})",
-        f"TP1 <b>{px(spec, sig['tp1'])}</b> ({signed(spec, sig['tp1'] - sig['entry'])} · {r1:.1f}R) → close ½, move SL to entry",
-        f"TP2 <b>{px(spec, sig['tp2'])}</b> ({signed(spec, sig['tp2'] - sig['entry'])} · {r2:.1f}R)",
-        f"Lot <b>{sig['lots']:.2f}</b> → risk ${sig['risk_usd']:.2f} ({sig['risk_pct']:.1f}% of ${cfg.account_balance:,.0f})",
     ]
+    if single:
+        lines.append(f"TP <b>{px(spec, sig['tp1'])}</b> ({signed(spec, sig['tp1'] - sig['entry'])} · {r1:.1f}R) → close all")
+    else:
+        part = float(sig.get("partial", 0.5))
+        share = "½" if abs(part - 0.5) < 1e-9 else f"{part * 100:.0f}%"
+        be = ", move SL to entry" if sig.get("be", True) else ""
+        lines += [f"TP1 <b>{px(spec, sig['tp1'])}</b> ({signed(spec, sig['tp1'] - sig['entry'])} · {r1:.1f}R) → close {share}{be}",
+                  f"TP2 <b>{px(spec, sig['tp2'])}</b> ({signed(spec, sig['tp2'] - sig['entry'])} · {r2:.1f}R)"]
+    lines.append(f"Lot <b>{sig['lots']:.2f}</b> → risk ${sig['risk_usd']:.2f} ({sig['risk_pct']:.1f}% of ${cfg.account_balance:,.0f})")
     if sig["risk_pct"] > cfg.max_risk_pct_warn:
         lines.append(f"⚠️ Even the minimum lot risks {sig['risk_pct']:.1f}% here — consider skipping.")
     elif sig["risk_pct"] > cfg.risk_pct * 1.25:
         lines.append(f"<i>Min lot is above your {cfg.risk_pct:g}% target on this stop.</i>")
     lines += ["", "<b>Why</b>"] + [f"• {esc(r)}" for r in sig["reasons"]]
     extra = []
+    if validation:
+        u = validation.get("unseen")
+        tag = "✅ passed the unseen-data test" if validated else "not validated"
+        extra.append(f"🔬 Strategy <b>{esc(validation['name'])}</b>: {tag}" + (f" ({fmt_stats(u)})" if u and u.get("n") else ""))
     if review:
         icon = {"confirm": "✅", "caution": "⚠️", "reject": "⛔"}[review["verdict"]]
         extra.append(f"🤖 Claude check: {icon} {review['verdict'].upper()} — {esc(review['reason'])}")
-    if calib and calib.get("n", 0) >= 5:
-        extra.append(f"🧪 Backtest, grade {sig['grade']}: TP1 hit {calib['tp1_rate'] * 100:.0f}% · "
-                     f"avg {calib['avg_r']:+.2f}R · n={calib['n']}")
+    if calib and calib.get("n", 0) >= 5 and not (validation and validation.get("unseen")):
+        extra.append(f"🧪 Backtest: TP1 hit {calib['tp1_rate'] * 100:.0f}% · avg {calib['avg_r']:+.2f}R · n={calib['n']}")
     if extra:
         lines += [""] + extra
     lines += ["", f"<i>Signal #{sig.get('id', '?')} · skip it if price is already past the 'valid' level · "
@@ -70,16 +93,18 @@ def signal_message(sig: dict, spec: SymbolSpec, cfg: Config, news_b: float | Non
     return "\n".join(lines)
 
 
-def short_caption(sig: dict, spec: SymbolSpec) -> str:
-    return (f"{'🟢' if sig['side'] == 'BUY' else '🔴'} <b>{sig['side']} {esc(spec.display)}</b> #{sig.get('id', '?')} · "
-            f"entry {px(spec, sig['entry'])} · SL {px(spec, sig['sl'])} · TP1 {px(spec, sig['tp1'])} · "
-            f"TP2 {px(spec, sig['tp2'])}")
+def short_caption(sig: dict, spec: SymbolSpec, paper: bool = False) -> str:
+    return (("📝 PAPER · " if paper else "") +
+            f"{'🟢' if sig['side'] == 'BUY' else '🔴'} <b>{sig['side']} {esc(spec.display)}</b> #{sig.get('id', '?')} · "
+            f"entry {px(spec, sig['entry'])} · SL {px(spec, sig['sl'])} · TP {px(spec, sig['tp1'])}")
 
 
 def track_message(sig: dict, spec: SymbolSpec, event: str, price: float) -> str:
     tag = f"#{sig.get('id', '?')} {sig['side']} {esc(spec.display)}"
     usd = (sig.get("result_r") or 0) * sig.get("risk_usd", 0)
     total = f"total {sig.get('result_r', 0):+.2f}R (≈ {'+' if usd >= 0 else '−'}${abs(usd):.2f} at {sig['lots']:.2f} lot)"
+    if event == "tp1" and float(sig.get("partial", 0.5)) >= 0.999:
+        return f"✅ <b>{tag} hit its target</b> {px(spec, price)} — closed, {total}"
     if event == "tp1":
         return (f"✅ <b>{tag} hit TP1</b> {px(spec, price)}\n"
                 f"Close half, move SL to entry {px(spec, sig['entry'])}. Runner targets TP2 {px(spec, sig['tp2'])}.")
@@ -132,7 +157,10 @@ def status_message(summaries: list[dict], biases: dict, cfg: Config, now: dateti
             if v.get("veto"):
                 tag += f", blocked: {esc(v['veto'])}"
             return f"{name} {v['score']}/100 ({tag})"
-        lines += ["", f"<b>{esc(s['display'])} {s['price']}</b>",
+        strat = ""
+        if s.get("strategy"):
+            strat = f"Strategy: {esc(s['strategy'])} ({'✅ validated' if s.get('validated') else '📝 paper'})"
+        lines += ["", f"<b>{esc(s['display'])} {s['price']}</b>"] + ([strat] if strat else []) + [
                   f"Trend: H4 {s['trend_h4']} · H1 {s['trend_h1']} · M15 {s['trend_m15']}",
                   f"RSI M15 {s['rsi_m15']:.0f} · H1 {s['rsi_h1'] or 0:.0f} · ADX H1 {s['adx_h1'] or 0:.0f} · ATR M15 {s['atr_m15']}",
                   f"Resistance: {res}", f"Support: {sup}",
@@ -147,7 +175,7 @@ def status_message(summaries: list[dict], biases: dict, cfg: Config, now: dateti
     if events:
         lines += ["", "<b>Next events</b>"] + [
             f"{when(e['time'], cfg, both=False)} {esc(e['country'])} {esc(e['title'])} ({e['impact']})" for e in events[:5]]
-    lines.append(f"\n<i>Buy/Sell score = trend + trigger confluence; a signal needs ≥{cfg.min_score} and a trigger.</i>")
+    lines.append("\n<i>Buy/Sell score = trend + trigger confluence (0–100). 📝 paper = strategy not validated yet.</i>")
     return "\n".join(lines)
 
 
@@ -267,4 +295,57 @@ def free_brief(title: str, summaries: list[dict], events: list[dict], headlines:
     note = "AI brief failed this time, so this is the rule-based version." if ai_failed else \
         "Free mode: no AI key set. Add one later for written analysis with live web search."
     lines += ["", f"<i>{note} Bias, not certainty · not financial advice.</i>"]
+    return "\n".join(lines)
+
+
+def research_message(spec: SymbolSpec, res: dict, active: str, overridden: bool, switched_from: str | None) -> str:
+    from .research import rank_score  # local import to avoid a cycle
+    rows = res["rows"]
+    from .research import TUNE_RULES
+    # Rule sets with enough tuning trades first, then by tuning score.
+    ranked = sorted(rows, key=lambda r: (r["tune"].get("n", 0) >= TUNE_RULES["n"], rank_score(r["tune"])),
+                    reverse=True)
+    start, split, end = res["start"][:10], res["split"][:10], res["end"][:10]
+    lines = [f"🔬 <b>Strategy research — {esc(spec.display)}</b>",
+             f"{start} → {end} · {len(rows)} rule sets tested",
+             f"Tuned on {start} → {split}, then checked on <b>unseen</b> data {split} → {end}.",
+             "", "<b>Top 5 on the tuning period</b>"]
+    for k, r in enumerate(ranked[:5], 1):
+        lines.append(f"{k}. <b>{esc(r['name'])}</b> {'✅' if r['passed'] else '❌'} — {esc(r['desc'])}")
+        lines.append(f"   tuning: {fmt_stats(r['tune'])}")
+        lines.append(f"   unseen: {fmt_stats(r['unseen'])}")
+    v1 = next((r for r in rows if r["name"] == "v1"), None)
+    if v1 and v1 not in ranked[:5]:
+        lines.append(f"Original v1 — tuning: {fmt_stats(v1['tune'])} | unseen: {fmt_stats(v1['unseen'])}")
+    lines.append("")
+    w = res["winner"]
+    if w:
+        desc = next(r["desc"] for r in rows if r["name"] == w)
+        lines.append(f"✅ <b>Winner: {esc(w)}</b> — {esc(desc)}. It made money on the tuning AND the unseen period.")
+    else:
+        lines.append("❌ <b>No rule set held up on the unseen period.</b>")
+    if overridden:
+        lines.append(f"Live strategy stays <b>{esc(active)}</b> (set by you in the XAU_/BTC_STRATEGY variable).")
+    elif w:
+        lines.append(f"➡️ Live signals now use <b>{esc(active)}</b>" +
+                     (f" (was {esc(switched_from)})." if switched_from and switched_from != active else "."))
+    else:
+        lines.append(f"➡️ Signals continue as 📝 <b>PAPER</b> signals (strategy {esc(active)}), for testing only.")
+    lines.append("<i>A pass is evidence, not proof: paper-trade ~2 weeks before real money. "
+                 "Full table: GitHub → Actions → this run → Artifacts.</i>")
+    return "\n".join(lines)
+
+
+def news_digest(items: list[dict], cfg: Config, hours: int, now: datetime) -> str:
+    lines = [f"📰 <b>News digest</b> · last {hours}h · {when(now, cfg, both=False)}"]
+    for it in items:
+        sc = it.get("score", {})
+        if it["kind"] == "crypto":
+            tag = f"BTC {ARROWS.get(sc.get('btc', 0), '•')}"
+        else:
+            tag = f"Gold {ARROWS.get(sc.get('xau', 0), '•')} BTC {ARROWS.get(sc.get('btc', 0), '•')}"
+        link = f" · <a href=\"{esc(it['link'])}\">link</a>" if it.get("link") else ""
+        lines.append(f"• <b>{tag}</b> {esc(it['title'][:160])} — <i>{esc(it['source'])} "
+                     f"{when(it['published'], cfg, both=False)}</i>{link}")
+    lines.append("<i>▲ bullish · ▼ bearish · • neutral/unclear (keyword rules, not advice)</i>")
     return "\n".join(lines)

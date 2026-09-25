@@ -30,13 +30,23 @@ def _session() -> requests.Session:
     return s
 
 
+EMPTY = pd.DataFrame(columns=["open", "high", "low", "close", "volume"],
+                     index=pd.DatetimeIndex([], tz="UTC", name="time"))
+
+
 def fetch_twelvedata(symbol: str, tf: str, n: int, api_key: str | None,
-                     session: requests.Session | None = None) -> pd.DataFrame:
+                     session: requests.Session | None = None,
+                     start: datetime | None = None, end: datetime | None = None) -> pd.DataFrame:
+    """Latest `n` bars, or (with start/end) every bar in that UTC window (keep windows < 5000 bars)."""
     if not api_key:
         raise DataError("TWELVEDATA_API_KEY is not set")
     session = session or _session()
     params = {"symbol": symbol, "interval": TD_INTERVAL[tf], "outputsize": min(int(n), 5000),
               "timezone": "UTC", "order": "asc", "apikey": api_key}
+    if start is not None and end is not None:
+        params["start_date"] = start.strftime("%Y-%m-%d %H:%M:%S")
+        params["end_date"] = end.strftime("%Y-%m-%d %H:%M:%S")
+        params["outputsize"] = 5000
     for attempt in range(2):
         r = session.get("https://api.twelvedata.com/time_series", params=params, timeout=30)
         try:
@@ -49,10 +59,14 @@ def fetch_twelvedata(symbol: str, tf: str, n: int, api_key: str | None,
                 log.warning("Twelve Data rate limit hit, sleeping 62s")
                 time.sleep(62)
                 continue
+            if start is not None and "no data" in str(j.get("message", "")).lower():
+                return EMPTY.copy()   # window before the start of the available history
             raise DataError(f"Twelve Data error {code}: {j.get('message')}")
         break
     values = j.get("values") or []
     if not values:
+        if start is not None:
+            return EMPTY.copy()
         raise DataError(f"Twelve Data returned no candles for {symbol} {tf}")
     df = pd.DataFrame(values)
     df["time"] = pd.to_datetime(df["datetime"], utc=True)
@@ -148,4 +162,42 @@ def get_history(spec: SymbolSpec, cfg: Config, session: requests.Session | None 
         df = fetch_twelvedata(spec.td_symbol, tf, n, cfg.twelvedata_key, session)
         df = apply_offset(df, spec.price_offset)
         out[tf], _ = split_closed(df, tf, now)
+    return out
+
+
+# Window sizes keep every request under Twelve Data's 5000-bar cap (M15 24/7: 96 bars/day).
+WINDOW_DAYS = {"M15": 40, "H1": 180, "H4": 400}
+WARMUP_DAYS = {"M15": 5, "H1": 20, "H4": 90}
+
+
+def get_long_history(spec: SymbolSpec, cfg: Config, days: int = 300, session: requests.Session | None = None,
+                     pause: float = 7.8, sleep=time.sleep, now: datetime | None = None) -> dict:
+    """~`days` of M15/H1/H4 history by paging backwards through Twelve Data (free plan: 8 requests/min).
+
+    Uses about 11 API credits per symbol. Stops early if the provider has no older data.
+    """
+    session = session or _session()
+    now = now or datetime.now(timezone.utc)
+    out, calls = {}, 0
+    for tf in ("M15", "H1", "H4"):
+        need_start = now - timedelta(days=days + WARMUP_DAYS[tf])
+        end, parts = now, []
+        while end > need_start:
+            start = max(need_start, end - timedelta(days=WINDOW_DAYS[tf]))
+            if calls:
+                sleep(pause)            # stay under the free plan's per-minute limit
+            df = fetch_twelvedata(spec.td_symbol, tf, 5000, cfg.twelvedata_key, session, start=start, end=end)
+            calls += 1
+            if df.empty:
+                break
+            parts.append(df)
+            end = start
+        if not parts:
+            raise DataError(f"no {tf} history for {spec.td_symbol}")
+        df = pd.concat(parts).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        df = apply_offset(df, spec.price_offset)
+        out[tf], _ = split_closed(df, tf, now)
+    log.info("%s history: %d M15 bars from %s (%d API calls)", spec.key, len(out["M15"]),
+             out["M15"].index[0] if len(out["M15"]) else "-", calls)
     return out

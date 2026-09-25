@@ -10,6 +10,7 @@ import os
 
 from .config import Config, SymbolSpec
 from .strategy import Context, evaluate_at
+from .variants import V1, Params
 from .tracker import advance, init_tracking, stats
 
 
@@ -21,7 +22,7 @@ def first_ready_index(ctx: Context) -> int:
     return max(int(idx), 250)
 
 
-def run(ctx: Context, cfg: Config) -> tuple[list[dict], dict]:
+def run(ctx: Context, cfg: Config, params: Params = V1) -> tuple[list[dict], dict]:
     spec: SymbolSpec = ctx.spec
     A, times = ctx.A, [t.isoformat() for t in ctx.m.index]
     expiry = int(cfg.signal_expiry_hours * 4)
@@ -37,7 +38,7 @@ def run(ctx: Context, cfg: Config) -> tuple[list[dict], dict]:
             continue
         if i - last_close < cooldown_bars:
             continue
-        ev = evaluate_at(ctx, i, cfg)
+        ev = evaluate_at(ctx, i, cfg, params=params)
         if ev.signal:
             open_sig = init_tracking(dict(ev.signal))
     result = {"all": stats(trades)}
@@ -52,7 +53,7 @@ def run(ctx: Context, cfg: Config) -> tuple[list[dict], dict]:
 
 def save_csv(trades: list[dict], path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    cols = ["symbol", "side", "grade", "score", "setup", "bar_time", "entry", "sl", "tp1", "tp2",
+    cols = ["strategy", "symbol", "side", "grade", "score", "setup", "bar_time", "entry", "sl", "tp1", "tp2",
             "tp1_hit", "exit_reason", "exit_price", "closed_at", "result_r", "lots", "risk_usd"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")

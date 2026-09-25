@@ -25,6 +25,8 @@ DEFAULT = {
 
 
 def _json_default(o):
+    if hasattr(o, "item"):          # numpy scalars (bool_, float64, int64)
+        return o.item()
     if isinstance(o, float) and math.isinf(o):
         return 999.0
     raise TypeError(str(type(o)))

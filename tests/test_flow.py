@@ -1,6 +1,7 @@
 """End-to-end runs of the agent with fake market data, fake Claude and a dry-run Telegram."""
 import json
-from datetime import timedelta
+import os
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -147,14 +148,16 @@ def test_brief_and_weekly_and_backtest(market, cfg, tmp_path, monkeypatch):
     monkeypatch.setattr(news, "fetch_headlines", lambda now, max_age_hours=12, session=None: ([], {}))
     now = (market["XAUUSD"][0].index[-1] + timedelta(minutes=20)).to_pydatetime()
 
-    def history(spec, cfg):
+    def history(spec, cfg, days=None):
         m15, h1, h4 = market[spec.key]
         return {"M15": m15, "H1": h1, "H4": h4}
 
     tg = FakeTelegram(str(tmp_path / "o"))
-    a = agent_main.Agent(cfg, now=now, telegram=tg, llm_client=FakeClaude(), fetch=make_fetch(market), history=history)
+    a = agent_main.Agent(cfg, now=now, telegram=tg, llm_client=FakeClaude(), fetch=make_fetch(market),
+                         history=history, long_history=history)
     a.run("brief-london")
-    a.run_weekly()
+    a.run_weekly()          # scoreboard + research
+    a.run_backtest()
     a.finish()
     assert not a.errors, a.errors
     texts = [m["text"] for m in tg.sent]
@@ -163,9 +166,21 @@ def test_brief_and_weekly_and_backtest(market, cfg, tmp_path, monkeypatch):
     assert "<b>What's driving markets</b>" in brief
     assert 'href="https://www.reuters.com/markets/x"' in brief
     assert any("Weekly report" in t for t in texts)
+    research = [strip_tags(t) for t in texts if "Strategy research" in t]
+    assert len(research) == 2
+    for r in research:
+        assert "Top 5 on the tuning period" in r and ("Winner:" in r or "No rule set held up" in r)
     assert sum("Backtest" in t for t in texts) == 2
     st = json.load(open(f"{cfg.state_dir}/state.json"))
     assert set(st["calibration"]) == {"XAUUSD", "BTCUSD"}
+    assert set(st["research"]) == {"XAUUSD", "BTCUSD"}
+    assert os.path.exists(f"{cfg.state_dir}/research_XAUUSD.csv")
+    # The live strategy follows the research winner (or stays v1 in paper mode).
+    b = agent_main.Agent(cfg, now=now, telegram=FakeTelegram(None))
+    for key in ("XAUUSD", "BTCUSD"):
+        p, v, overridden = b.active_strategy(key)
+        winner = st["research"][key]["winner"]
+        assert p.name == (winner or "v1") and v["validated"] == bool(winner) and not overridden
 
 
 def test_connection_test_mode(cfg, tmp_path, monkeypatch):
@@ -212,3 +227,40 @@ def test_free_mode_without_ai_key(market, tmp_path, monkeypatch):
     assert "bias" in brief and "Plan:" in brief and "Non-Farm Employment Change" in brief
     assert "Bitcoin ETF inflows hit record" in brief and "BTC ▲▲" in brief
     assert "Free mode" in brief
+
+
+def test_news_digest_every_two_hours(market, tmp_path, monkeypatch):
+    cfg = Config(state_dir=str(tmp_path / "s3"), telegram_chat_id="-100123", anthropic_key=None, dry_run=True)
+    monkeypatch.setattr(news, "fetch_calendar", lambda session=None: [])
+    base = datetime(2026, 9, 24, 7, 50, tzinfo=timezone.utc)
+    pool = [
+        ("a", "FXStreet", "macro", "Gold climbs as the US dollar slides after soft PCE", 20),
+        ("b", "CoinDesk", "crypto", "Bitcoin ETF inflows hit a record", 35),
+        ("c", "Decrypt", "crypto", "New memecoin launches on Solana", 40),            # not relevant
+        ("d", "CoinDesk", "crypto", "Bitcoin miners sell as hashprice drops", 150),   # arrives later
+    ]
+
+    def fake_headlines(now, max_age_hours=12, session=None):
+        items = []
+        for id_, src, kind, title, minutes in pool:
+            pub = base + timedelta(minutes=minutes)
+            if pub <= now:
+                items.append({"id": id_, "source": src, "title": title, "summary": "", "kind": kind,
+                              "link": f"https://example.com/{id_}", "published": pub.isoformat()})
+        return items, {}
+    monkeypatch.setattr(news, "fetch_headlines", fake_headlines)
+    sent = []
+    for k in range(0, 4 * 5):                       # 07:53 .. 12:38 UTC
+        now = base + timedelta(minutes=3 + 15 * k)
+        tg = FakeTelegram(str(tmp_path / "o3"))
+        a = agent_main.Agent(cfg, now=now, telegram=tg, fetch=make_fetch(market))
+        a.step_calendar()
+        a.step_news()
+        a.finish()
+        sent += [(now, strip_tags(m["text"])) for m in tg.sent if "News digest" in m["text"]]
+    hours = [n.hour for n, _ in sent]
+    assert hours == [8, 10, 12], hours              # at most one digest per even hour
+    text = "\n".join(t for _, t in sent)
+    for title in ("Gold climbs", "Bitcoin ETF", "hashprice"):
+        assert text.count(title) == 1, title        # every relevant headline exactly once
+    assert "memecoin" not in text                   # irrelevant crypto noise filtered out

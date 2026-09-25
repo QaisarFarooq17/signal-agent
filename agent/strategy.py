@@ -25,6 +25,7 @@ import pandas as pd
 
 from .config import Config, SymbolSpec
 from .indicators import enrich, swing_events
+from .variants import V1, Params
 
 H1_COLS = ["close", "ema20", "ema50", "rsi", "atr", "macd_hist", "adx", "pdi", "mdi", "st_dir"]
 H4_COLS = ["close", "ema50", "ema200", "ema50_slope", "st_dir", "rsi", "atr"]
@@ -82,7 +83,17 @@ def build_context(m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame, spec: S
     mm["piv_r1"], mm["piv_s1"] = 2 * P - mm["pd_low"], 2 * P - mm["pd_high"]
     mm["piv_r2"], mm["piv_s2"] = P + (mm["pd_high"] - mm["pd_low"]), P - (mm["pd_high"] - mm["pd_low"])
 
+    # Asian session range (00:00-07:00 UTC) of the same day, known only from 07:00 UTC on.
+    hours = mm.index.hour
+    asia = mm[hours < 7]
+    g = asia.groupby(asia.index.floor("D")).agg(hi=("high", "max"), lo=("low", "min"), n=("high", "size"))
+    g = g[g["n"] >= 20]
+    after = hours >= 7
+    mm["asia_hi"] = np.where(after, g["hi"].reindex(day).to_numpy(), np.nan)
+    mm["asia_lo"] = np.where(after, g["lo"].reindex(day).to_numpy(), np.nan)
+
     A = {c: mm[c].to_numpy() for c in mm.columns if c != "ct"}
+    A["hour"] = np.asarray(hours)
     ctx = Context(spec=spec, m=mm, A=A, ct_ns=pd.DatetimeIndex(mm["ct"]).as_unit("ns").asi8)
 
     highs, lows = swing_events(h, k=3)
@@ -166,25 +177,26 @@ def _trend_points(A, i, s):
     return pts, why
 
 
-def _trigger(A, i, s):
+def _trigger(A, i, s, setups=("pullback", "breakout")):
     if i < 25:
         return 0, None, []
     c, o, h, l = A["close"], A["open"], A["high"], A["low"]
     e20, e50, r, at = A["ema20"], A["ema50"], A["rsi"], A["atr"]
     pts, setup, why = 0, None, []
-    rng = range(i - 6, i + 1)
-    if s > 0:
-        touched = any(l[j] <= e20[j] + 0.25 * at[j] for j in rng)
-        intact = all(c[j] >= e50[j] - 0.5 * at[j] for j in rng)
-        resume = c[i] > e20[i] and c[i] > o[i] and 40 <= r[i] <= 68 and r[i] > r[i - 1]
-    else:
-        touched = any(h[j] >= e20[j] - 0.25 * at[j] for j in rng)
-        intact = all(c[j] <= e50[j] + 0.5 * at[j] for j in rng)
-        resume = c[i] < e20[i] and c[i] < o[i] and 32 <= r[i] <= 60 and r[i] < r[i - 1]
-    if touched and intact and resume:
-        pts, setup = 20, "pullback"
-        why.append(f"M15 pullback into EMA20/50 zone, momentum resuming (RSI {r[i]:.0f})")
-    else:
+    if "pullback" in setups:
+        rng = range(i - 6, i + 1)
+        if s > 0:
+            touched = any(l[j] <= e20[j] + 0.25 * at[j] for j in rng)
+            intact = all(c[j] >= e50[j] - 0.5 * at[j] for j in rng)
+            resume = c[i] > e20[i] and c[i] > o[i] and 40 <= r[i] <= 68 and r[i] > r[i - 1]
+        else:
+            touched = any(h[j] >= e20[j] - 0.25 * at[j] for j in rng)
+            intact = all(c[j] <= e50[j] + 0.5 * at[j] for j in rng)
+            resume = c[i] < e20[i] and c[i] < o[i] and 32 <= r[i] <= 60 and r[i] < r[i - 1]
+        if touched and intact and resume:
+            pts, setup = 20, "pullback"
+            why.append(f"M15 pullback into EMA20/50 zone, momentum resuming (RSI {r[i]:.0f})")
+    if not setup and "breakout" in setups:
         hi20, lo20 = float(np.max(h[i - 20:i])), float(np.min(l[i - 20:i]))
         wide = (h[i] - l[i]) >= 1.2 * at[i]
         expanding = _ok(A["bbw"][i], A["bbw"][i - 5]) and A["bbw"][i] > A["bbw"][i - 5]
@@ -194,6 +206,23 @@ def _trigger(A, i, s):
         elif s < 0 and c[i] < lo20 and wide and expanding and r[i] > 25:
             pts, setup = 18, "breakout"
             why.append(f"M15 breakdown below 5h range low {lo20:.2f} on expanding volatility")
+    if not setup and "rsi2" in setups:
+        r2, e200 = A["rsi2"], A["ema200"]
+        if s > 0 and r2[i - 1] < 10 <= r2[i] and c[i] > o[i] and c[i] > e200[i]:
+            pts, setup = 20, "rsi2"
+            why.append("RSI(2) bounced from oversold (<10) above the M15 EMA200")
+        elif s < 0 and r2[i - 1] > 90 >= r2[i] and c[i] < o[i] and c[i] < e200[i]:
+            pts, setup = 20, "rsi2"
+            why.append("RSI(2) turned down from overbought (>90) below the M15 EMA200")
+    if not setup and "london" in setups:
+        ahi, alo, hr = A["asia_hi"][i], A["asia_lo"][i], A["hour"][i]
+        if _ok(ahi, alo) and 7 <= hr < 11 and at[i] > 0 and 1.0 <= (ahi - alo) / at[i] <= 8.0:
+            if s > 0 and c[i] > ahi and c[i - 1] <= ahi:
+                pts, setup = 20, "london"
+                why.append(f"London session broke above the Asian range high {ahi:.2f}")
+            elif s < 0 and c[i] < alo and c[i - 1] >= alo:
+                pts, setup = 20, "london"
+                why.append(f"London session broke below the Asian range low {alo:.2f}")
     if setup:
         if s > 0 and (A["bull_engulf"][i] or A["bull_pin"][i]):
             pts += 7
@@ -247,12 +276,12 @@ def position_size(spec: SymbolSpec, cfg: Config, sl_dist: float):
     return lots, risk, (risk / cfg.account_balance * 100.0 if cfg.account_balance else 0.0)
 
 
-def _side(ctx, i, s, cfg, news_bias) -> SideEval:
+def _side(ctx, i, s, cfg, news_bias, params: Params = V1) -> SideEval:
     A, spec = ctx.A, ctx.spec
     ev = SideEval(side="BUY" if s > 0 else "SELL")
     tpts, twhy = _trend_points(A, i, s)
     ev.trend_pts = tpts
-    trig, setup, gwhy = _trigger(A, i, s)
+    trig, setup, gwhy = _trigger(A, i, s, params.setups)
     ev.setup = setup
     pts = tpts + trig
     why = twhy + gwhy
@@ -280,12 +309,12 @@ def _side(ctx, i, s, cfg, news_bias) -> SideEval:
         else:
             struct = float(np.max(A["high"][i - 10:i + 1]))
             raw = struct - entry + 0.3 * atr_i + spec.spread
-        sl_dist = min(max(raw, 1.0 * atr_i), 2.5 * atr_i)
-        if raw > 2.5 * atr_i:
-            why.append("stop capped at 2.5×ATR (structure is far)")
+        sl_dist = min(max(raw, params.sl_min_atr * atr_i), params.sl_max_atr * atr_i)
+        if raw > params.sl_max_atr * atr_i:
+            why.append(f"stop capped at {params.sl_max_atr:g}×ATR (structure is far)")
         sl = entry - s * sl_dist
-        tp1 = entry + s * 1.5 * sl_dist
-        tp2 = entry + s * 3.0 * sl_dist
+        tp1 = entry + s * params.tp1_r * sl_dist
+        tp2 = entry + s * params.tp2_r * sl_dist
         opp = [(n, p) for n, p in key_levels(ctx, i) if s * (p - entry) > 0.2 * atr_i]
         nearest = min(opp, key=lambda x: abs(x[1] - entry)) if opp else None
         room = abs(nearest[1] - entry) / sl_dist if nearest else float("inf")
@@ -293,7 +322,7 @@ def _side(ctx, i, s, cfg, news_bias) -> SideEval:
             pts += 5
             if nearest:
                 why.append(f"clear room: next level {nearest[0]} {nearest[1]:.{spec.decimals}f} ({room:.1f}R)")
-            if nearest and room < 3.0:
+            if nearest and room < params.tp2_r and params.partial < 1.0:
                 tp2 = nearest[1] - s * 0.1 * atr_i
                 why.append(f"TP2 placed just before {nearest[0]}")
         elif room >= 1.5:
@@ -316,12 +345,33 @@ def grade(score: int) -> str:
     return "A" if score >= 80 else "B"
 
 
+def _rule_block(A, i, s, params: Params, close_t) -> str | None:
+    """Hard filters of the chosen rule set. Returns a reason when the side is not allowed."""
+    if params.sides == "buy" and s < 0:
+        return "rule set trades BUY only"
+    if params.sides == "sell" and s > 0:
+        return "rule set trades SELL only"
+    if params.require_h4:
+        c4, e50, e200 = A["h4_close"][i], A["h4_ema50"][i], A["h4_ema200"][i]
+        if not (_ok(c4, e50, e200) and s * (c4 - e50) > 0 and s * (e50 - e200) > 0):
+            return "H4 trend not aligned"
+    if params.require_h1:
+        c1, e20, e50 = A["h1_close"][i], A["h1_ema20"][i], A["h1_ema50"][i]
+        if not (_ok(c1, e20, e50) and s * (e20 - e50) > 0 and s * (c1 - e50) > 0):
+            return "H1 trend not aligned"
+    if params.adx_min and not (_ok(A["h1_adx"][i]) and A["h1_adx"][i] >= params.adx_min):
+        return f"H1 ADX below {params.adx_min:g}"
+    if params.sessions_utc and not any(_in_window(close_t, a, b) for a, b in params.sessions_utc):
+        return "outside the rule set's trading hours"
+    return None
+
+
 def evaluate_at(ctx: Context, i: int, cfg: Config, news_bias: float = 0.0,
-                blackout: str | None = None) -> Evaluation:
+                blackout: str | None = None, params: Params = V1) -> Evaluation:
     A, spec = ctx.A, ctx.spec
     t = ctx.m.index[i]
     ev = Evaluation(symbol=spec.key, bar_time=t.isoformat(), price=float(A["close"][i]), atr=float(A["atr"][i]),
-                    buy=_side(ctx, i, +1, cfg, news_bias), sell=_side(ctx, i, -1, cfg, news_bias))
+                    buy=_side(ctx, i, +1, cfg, news_bias, params), sell=_side(ctx, i, -1, cfg, news_bias, params))
     close_t = t + timedelta(minutes=15)
     veto = blackout
     for a, b in spec.blackouts_utc:
@@ -334,12 +384,18 @@ def evaluate_at(ctx: Context, i: int, cfg: Config, news_bias: float = 0.0,
         veto = veto or "volatility spike (ATR in top 2%) — let it settle"
     ev.global_veto = veto
 
+    min_score = cfg.min_score if params.min_score is None else params.min_score
     candidates = []
     for se, s in ((ev.buy, 1), (ev.sell, -1)):
         if s < 0 and not cfg.allow_sells:
             continue
-        if se.setup and se.plan and not se.veto and not veto and se.score >= cfg.min_score:
-            candidates.append((se.score, s, se))
+        if not (se.setup and se.plan and not se.veto and not veto and se.score >= min_score):
+            continue
+        block = _rule_block(A, i, s, params, close_t)
+        if block:
+            se.veto = se.veto or block
+            continue
+        candidates.append((se.score, s, se))
     if candidates:
         _, s, se = max(candidates, key=lambda x: x[0])
         p = se.plan
@@ -352,6 +408,7 @@ def evaluate_at(ctx: Context, i: int, cfg: Config, news_bias: float = 0.0,
             "setup": se.setup, "reasons": se.reasons, "lots": lots, "risk_usd": round(risk, 2),
             "risk_pct": round(risk_pct, 2), "room_r": p["room_r"],
             "nearest": list(p["nearest"]) if p["nearest"] else None,
+            "strategy": params.name, "partial": params.partial, "be": params.be_after_tp1,
         }
     return ev
 
