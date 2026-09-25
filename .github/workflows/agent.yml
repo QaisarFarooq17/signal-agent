@@ -1,0 +1,112 @@
+name: signal-agent
+
+# All cron times are UTC (= Exness MT5 server time). Rome is UTC+2 in summer, UTC+1 in winter.
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * 1-5"   # tick: every 15 min, Mon–Fri
+    - cron: "25 6 * * 1-5"           # London brief  (08:25 Rome summer / 07:25 winter)
+    - cron: "10 12 * * 1-5"          # New York brief (14:10 Rome summer / 13:10 winter)
+    - cron: "40 20 * * 5"            # Friday: weekly report + backtest refresh
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        default: test
+        options: [test, status, tick, brief-london, brief-ny, weekly, backtest]
+
+permissions:
+  contents: write        # only used by the keep-alive step (empty commit every ~45 days)
+
+concurrency:
+  group: signal-agent    # never run two copies at once (they share state)
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Restore agent memory
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: agent-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: agent-state-
+
+      - name: Choose mode
+        id: mode
+        run: |
+          case "${{ github.event.schedule }}" in
+            "25 6 * * 1-5")  m=brief-london ;;
+            "10 12 * * 1-5") m=brief-ny ;;
+            "40 20 * * 5")   m=weekly ;;
+            "")              m="${{ inputs.mode }}" ;;
+            *)               m=tick ;;
+          esac
+          echo "mode=$m" >> "$GITHUB_OUTPUT"
+          mkdir -p .state
+
+      - name: Run agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACCOUNT_BALANCE: ${{ secrets.ACCOUNT_BALANCE || vars.ACCOUNT_BALANCE }}
+          RISK_PCT: ${{ vars.RISK_PCT }}
+          MIN_SCORE: ${{ vars.MIN_SCORE }}
+          ALLOW_SELLS: ${{ vars.ALLOW_SELLS }}
+          SYMBOLS: ${{ vars.SYMBOLS }}
+          XAU_PRICE_OFFSET: ${{ vars.XAU_PRICE_OFFSET }}
+          BTC_PRICE_OFFSET: ${{ vars.BTC_PRICE_OFFSET }}
+          XAU_SPREAD: ${{ vars.XAU_SPREAD }}
+          BTC_SPREAD: ${{ vars.BTC_SPREAD }}
+          DISPLAY_TZ: ${{ vars.DISPLAY_TZ }}
+          CLAUDE_MODEL_FAST: ${{ vars.CLAUDE_MODEL_FAST }}
+          CLAUDE_MODEL_SMART: ${{ vars.CLAUDE_MODEL_SMART }}
+          LLM_CAN_VETO: ${{ vars.LLM_CAN_VETO }}
+          LLM_REVIEW_SIGNALS: ${{ vars.LLM_REVIEW_SIGNALS }}
+          LLM_DAILY_CALL_CAP: ${{ vars.LLM_DAILY_CALL_CAP }}
+          COOLDOWN_MINUTES: ${{ vars.COOLDOWN_MINUTES }}
+          NEWS_BLACKOUT_MINUTES: ${{ vars.NEWS_BLACKOUT_MINUTES }}
+          SEND_CHARTS: ${{ vars.SEND_CHARTS }}
+        run: python -m agent.main "${{ steps.mode.outputs.mode }}"
+
+      - name: Save agent memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: agent-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload backtest trades (CSV)
+        if: steps.mode.outputs.mode == 'backtest' || steps.mode.outputs.mode == 'weekly'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ github.run_id }}
+          path: .state/backtest_*.csv
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Keep schedule alive
+        # GitHub pauses schedules in public repos after 60 days without commits.
+        if: steps.mode.outputs.mode == 'weekly'
+        run: |
+          last=$(git log -1 --format=%ct); now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 45 ]; then
+            git config user.name "signal-agent"
+            git config user.email "signal-agent@users.noreply.github.com"
+            git commit --allow-empty -m "keep-alive"
+            git push
+          fi
