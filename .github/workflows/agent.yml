@@ -6,14 +6,14 @@ on:
     - cron: "3,18,33,48 * * * 1-5"   # tick: every 15 min, Mon–Fri
     - cron: "25 6 * * 1-5"           # London brief  (08:25 Rome summer / 07:25 winter)
     - cron: "10 12 * * 1-5"          # New York brief (14:10 Rome summer / 13:10 winter)
-    - cron: "40 20 * * 5"            # Friday: weekly report + backtest refresh
+    - cron: "40 20 * * 5"            # Friday: weekly report + strategy research
   workflow_dispatch:
     inputs:
       mode:
         description: "What to run"
         type: choice
         default: test
-        options: [test, status, tick, brief-london, brief-ny, weekly, backtest]
+        options: [test, status, tick, brief-london, brief-ny, research, backtest, weekly]
 
 permissions:
   contents: write        # only used by the keep-alive step (empty commit every ~45 days)
@@ -25,7 +25,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -81,6 +81,12 @@ jobs:
           COOLDOWN_MINUTES: ${{ vars.COOLDOWN_MINUTES }}
           NEWS_BLACKOUT_MINUTES: ${{ vars.NEWS_BLACKOUT_MINUTES }}
           SEND_CHARTS: ${{ vars.SEND_CHARTS }}
+          NEWS_ALERT_MIN_IMPACT: ${{ vars.NEWS_ALERT_MIN_IMPACT }}
+          NEWS_DIGEST_HOURS: ${{ vars.NEWS_DIGEST_HOURS }}
+          XAU_STRATEGY: ${{ vars.XAU_STRATEGY }}
+          BTC_STRATEGY: ${{ vars.BTC_STRATEGY }}
+          AUTO_STRATEGY: ${{ vars.AUTO_STRATEGY }}
+          RESEARCH_DAYS: ${{ vars.RESEARCH_DAYS }}
         run: python -m agent.main "${{ steps.mode.outputs.mode }}"
 
       - name: Save agent memory
@@ -90,12 +96,14 @@ jobs:
           path: .state
           key: agent-state-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Upload backtest trades (CSV)
-        if: steps.mode.outputs.mode == 'backtest' || steps.mode.outputs.mode == 'weekly'
+      - name: Upload research / backtest tables (CSV)
+        if: steps.mode.outputs.mode == 'backtest' || steps.mode.outputs.mode == 'weekly' || steps.mode.outputs.mode == 'research'
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-${{ github.run_id }}
-          path: .state/backtest_*.csv
+          name: results-${{ github.run_id }}
+          path: |
+            .state/backtest_*.csv
+            .state/research_*.csv
           if-no-files-found: ignore
           retention-days: 30
 
